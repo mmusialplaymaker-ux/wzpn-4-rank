@@ -1,0 +1,13 @@
+# sekrety — NIGDY do repo
+secrets.toml
+.streamlit/secrets.toml
+# dane źródłowe / robocze (apka czyta tylko ranking_data.json)
+*teamy_kluby*.csv
+slownik_rozgrywek.csv
+wzpn.jpeg
+wzpn.jpg
+__pycache__/
+*.pyc
+data/ranking/ranking.html
+data/ranking/ranking_latest.csv
+# NIE ignorujemy: wzpn_app.py, wzpn_rank.py, requirements.txt, data/ranking/ranking_data.json
