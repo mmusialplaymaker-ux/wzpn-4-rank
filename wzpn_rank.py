@@ -427,31 +427,7 @@ def build_html(players, okres, logo=None, footer="playmaker.pro", me=""):
             .replace("__DATA__", json.dumps(players, ensure_ascii=False)))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--od", default="2026-08-01", help="początek miesiąca (RRRR-MM-DD)")
-    ap.add_argument("--do", dest="do_", default="2026-08-31", help="koniec miesiąca (RRRR-MM-DD)")
-    ap.add_argument("--outdir", default=os.path.join(HERE, "data", "ranking"))
-    a = ap.parse_args()
-    os.makedirs(a.outdir, exist_ok=True)
-
-    print("[LNP] łączę (tunel SSH musi być OTWARTY w osobnym oknie) ...")
-    lnp = connect(_cfg("PGDATABASE", required=True), _cfg("PGUSER", required=True), _cfg("PGPASSWORD", required=True, secret=True))
-    print("  OK")
-    rows = ranking_miesiac(lnp, a.od, a.do_)
-    print(f"  IV liga wlkp {a.od}..{a.do_}: {len(rows)} zawodników (z meczem w oknie)")
-    ids = [r[0] for r in rows]
-    now = overall_teraz(lnp, ids)
-    base = baza_2526(lnp, ids)
-    print(f"  overall teraz: {len(now)} | baza 25/26: {len(base)}")
-    tiers = tier_leagues(lnp)
-    odz = odznaki(lnp, ids, tiers)
-    print(f"  szczeble: {len(tiers)} | odznaki: {len(odz)}")
-    links = linki_playmaker(ids)
-    print(f"  linki playmaker: {len(links)}")
-    lnp.close()
-    tm, cm = load_maps()
-
+def _build_players(rows, now, base, odz, links, tm, cm):
     players = []
     for r in rows:
         (pid, keeper, mecze, avg_score, team_id, fn, ln, yob, team_name, club_id, club_name) = r
@@ -465,39 +441,110 @@ def main():
             "club": klub, "team": druzyna,
             "yob": (int(yob) if (yob and str(yob).isdigit()) else None),
             "keeper": bool(keeper), "mecze": int(mecze) if mecze is not None else 0,
-            "score": avg100,                 # FORMA miesiąca (AVG, ×100) = jak Excel
+            "score": avg100,                 # FORMA miesiąca / sezonu (AVG, ×100)
             "ov_now": ov_now, "ov_base": ov_base, "progres": prog,   # PROGRES (overall)
             "badge": odz.get(pid), "url": links.get(pid),
         })
     players.sort(key=lambda p: (p["score"] if p["score"] is not None else -1), reverse=True)
+    return players
 
-    try:
-        m = datetime.strptime(a.od, "%Y-%m-%d"); okres = f"{MIESIACE[m.month]} {m.year}"
-    except Exception:
-        okres = f"{a.od}..{a.do_}"
-    data = {"players": players, "sezon": "2026/27", "okres": okres, "od": a.od, "do": a.do_,
-            "wygenerowano": date.today().strftime("%Y-%m-%d"), "logo": _logo()}
-    outp = os.path.join(a.outdir, "ranking_data.json")
+
+def _zapisz_json(data, outdir, basename):
+    outp = os.path.join(outdir, basename + ".json")
     with open(outp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
-    with open(os.path.join(a.outdir, "ranking.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(players, okres, logo=data["logo"]))
+    return outp
 
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--od", default="2026-09-01", help="początek miesiąca (RRRR-MM-DD)")
+    ap.add_argument("--do", dest="do_", default="2026-09-30", help="koniec miesiąca (RRRR-MM-DD)")
+    ap.add_argument("--outdir", default=os.path.join(HERE, "data", "ranking"))
+    ap.add_argument("--tylko-miesiac", action="store_true",
+                    help="pomiń generowanie zakresu sezonu (szybciej)")
+    a = ap.parse_args()
+    os.makedirs(a.outdir, exist_ok=True)
+
+    SEZON_OD = "2026-07-01"
+    SEZON_DO = date.today().strftime("%Y-%m-%d")
+
+    print("[LNP] łączę (tunel SSH musi być OTWARTY w osobnym oknie) ...")
+    lnp = connect(_cfg("PGDATABASE", required=True),
+                  _cfg("PGUSER", required=True),
+                  _cfg("PGPASSWORD", required=True, secret=True))
+    print("  OK")
+
+    rows_mies = ranking_miesiac(lnp, a.od, a.do_)
+    print(f"  miesiąc {a.od}..{a.do_}: {len(rows_mies)} zawodników")
+
+    rows_sezon = []
+    if not a.tylko_miesiac:
+        rows_sezon = ranking_miesiac(lnp, SEZON_OD, SEZON_DO)
+        print(f"  sezon   {SEZON_OD}..{SEZON_DO}: {len(rows_sezon)} zawodników")
+
+    # wspólne queries dla union IDs - raz
+    ids_all = list({r[0] for r in rows_mies} | {r[0] for r in rows_sezon})
+    now = overall_teraz(lnp, ids_all)
+    base = baza_2526(lnp, ids_all)
+    print(f"  overall teraz: {len(now)} | baza 25/26: {len(base)}")
+    tiers = tier_leagues(lnp)
+    odz = odznaki(lnp, ids_all, tiers)
+    print(f"  szczeble: {len(tiers)} | odznaki: {len(odz)}")
+    links = linki_playmaker(ids_all)
+    print(f"  linki playmaker: {len(links)}")
+    lnp.close()
+    tm, cm = load_maps()
+    logo = _logo()
+
+    # ── MIESIĄC ──
+    players_mies = _build_players(rows_mies, now, base, odz, links, tm, cm)
+    try:
+        m = datetime.strptime(a.od, "%Y-%m-%d")
+        okres_mies = f"{MIESIACE[m.month]} {m.year}"
+    except Exception:
+        okres_mies = f"{a.od}..{a.do_}"
+    data_mies = {
+        "players": players_mies, "sezon": "2026/27", "okres": okres_mies,
+        "od": a.od, "do": a.do_, "zakres_typ": "miesiac",
+        "wygenerowano": date.today().strftime("%Y-%m-%d"), "logo": logo,
+    }
+    outp_mies = _zapisz_json(data_mies, a.outdir, "ranking_data")
+
+    # HTML + CSV generowany dla widoku miesięcznego (jak dotąd)
+    with open(os.path.join(a.outdir, "ranking.html"), "w", encoding="utf-8") as f:
+        f.write(build_html(players_mies, okres_mies, logo=logo))
     with open(os.path.join(a.outdir, "ranking_latest.csv"), "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["imie_nazwisko", "klub", "druzyna", "rocznik", "bramkarz", "mecze",
                     "score_forma", "overall_teraz", "overall_2526", "progres", "odznaka", "url"])
-        for p in players:
+        for p in players_mies:
             w.writerow([p["name"], p["club"], p["team"], p["yob"] or "", "TAK" if p["keeper"] else "", p["mecze"],
                         p["score"], p["ov_now"] if p["ov_now"] is not None else "",
                         p["ov_base"] if p["ov_base"] is not None else "",
                         p["progres"] if p["progres"] is not None else "", p["badge"] or "", p["url"] or ""])
 
-    polowi = sum(1 for p in players if not p["keeper"])
-    print(f"\n  RAZEM: {len(players)} (polowi {polowi}, bramkarze {len(players)-polowi}) | "
-          f"z progresem {sum(1 for p in players if p['progres'] is not None)} | z odznaką {sum(1 for p in players if p['badge'])}")
-    print(f"  okres: {okres}")
-    print(f"✓ JSON: {outp}")
+    polowi_m = sum(1 for p in players_mies if not p["keeper"])
+    print(f"\n  MIESIĄC: {len(players_mies)} (polowi {polowi_m}, bramkarze {len(players_mies)-polowi_m}) | "
+          f"z progresem {sum(1 for p in players_mies if p['progres'] is not None)} | "
+          f"z odznaką {sum(1 for p in players_mies if p['badge'])}")
+    print(f"  okres: {okres_mies}")
+    print(f"✓ JSON: {outp_mies}")
+
+    # ── SEZON TOTAL ──
+    if not a.tylko_miesiac:
+        players_sezon = _build_players(rows_sezon, now, base, odz, links, tm, cm)
+        data_sezon = {
+            "players": players_sezon, "sezon": "2026/27", "okres": "sezon 2026/27",
+            "od": SEZON_OD, "do": SEZON_DO, "zakres_typ": "sezon",
+            "wygenerowano": date.today().strftime("%Y-%m-%d"), "logo": logo,
+        }
+        outp_sezon = _zapisz_json(data_sezon, a.outdir, "ranking_sezon")
+        polowi_s = sum(1 for p in players_sezon if not p["keeper"])
+        print(f"\n  SEZON:   {len(players_sezon)} (polowi {polowi_s}, bramkarze {len(players_sezon)-polowi_s}) | "
+              f"z progresem {sum(1 for p in players_sezon if p['progres'] is not None)}")
+        print(f"  zakres: {SEZON_OD}..{SEZON_DO}")
+        print(f"✓ JSON: {outp_sezon}")
 
 
 if __name__ == "__main__":
