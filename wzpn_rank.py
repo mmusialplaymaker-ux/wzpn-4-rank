@@ -32,7 +32,12 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 SEASON_2627 = "3c77d143-8010-4073-9842-d6b63365ffce"
-SEASON_2526 = "e9d66181-d03e-4bb3-b889-4da648f4831d"
+SEASON_2526 = "e9d66181-d03e-4bb3-b889-4da848f4831d"
+
+# W pm_player_match_score jest kilka wersji oceny na mecz (np. 1.0.0 stara, 3.0.0 nowa).
+# Bierzemy TYLKO jedna wersje — inaczej mecze liczą się podwójnie, a score to mix wersji.
+SCORE_VERSION = "3.0.0"
+VER_COL = None   # nazwa kolumny z wersja; wykrywana automatycznie po polaczeniu
 IV_LIGA_IDS = ["c164ca31-22e4-43fc-9e30-4f3bcc2b7d72"]
 REGION_IDS = ["fd118a32-2558-437c-a1d6-76a1f862e13d"]
 MIESIACE = ["", "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
@@ -84,6 +89,47 @@ def connect(dbname, user, password):
                             client_encoding="UTF8", connect_timeout=30)
 
 
+def wykryj_kolumne_wersji(lnp, override=None):
+    """Znajdz kolumne z wersja oceny w pm_player_match_score (np. 'version')."""
+    cur = lnp.cursor()
+    cur.execute("""SELECT column_name FROM information_schema.columns
+                   WHERE table_name = 'pm_player_match_score' ORDER BY ordinal_position""")
+    cols = [r[0] for r in cur.fetchall()]; cur.close()
+    if override:
+        if override not in cols:
+            sys.exit(f"Kolumna '{override}' nie istnieje. Dostepne: {', '.join(cols)}")
+        return override
+    kand = [c for c in cols if "version" in c.lower() or "wersj" in c.lower()]
+    if not kand:
+        sys.exit("Nie znalazlem kolumny z wersja score w pm_player_match_score.\n"
+                 f"Dostepne kolumny: {', '.join(cols)}\n"
+                 "Podaj ja recznie: --kolumna-wersji <nazwa>")
+    kand.sort(key=lambda c: (c.lower() != "version", len(c)))
+    return kand[0]
+
+
+def _vf(alias=""):
+    """Fragment WHERE ograniczajacy do jednej wersji score."""
+    if not VER_COL:
+        return ""
+    v = str(SCORE_VERSION).replace("'", "")
+    return f"AND {alias}{VER_COL}::text = '{v}'"
+
+
+def sprawdz_duplikaty(lnp, od, do):
+    """Ile par (zawodnik, mecz) ma >1 wiersz PO filtrze wersji. Powinno byc 0."""
+    cur = lnp.cursor()
+    cur.execute(f"""
+      SELECT count(*) FROM (
+        SELECT s.player_id, s.match_id
+        FROM pm_player_match_score s
+        WHERE s.season_id = %s AND s.league_id IN ({_inlist(IV_LIGA_IDS)})
+          AND s.match_date::date BETWEEN %s AND %s {_vf('s.')}
+        GROUP BY s.player_id, s.match_id HAVING count(*) > 1) x
+    """, (SEASON_2627, od, do))
+    n = cur.fetchone()[0]; cur.close(); return n
+
+
 def _inlist(ids):
     return ",".join("'" + str(x).replace("'", "") + "'" for x in ids) if ids else "NULL"
 
@@ -101,7 +147,7 @@ def ranking_miesiac(lnp, od, do):
       WITH agg AS (
         SELECT s.player_id,
                bool_or(m.is_keeper) AS keeper,
-               count(*)             AS mecze,
+               count(DISTINCT s.match_id) AS mecze,
                avg(s.score)         AS avg_score,
                max(s.team_id::text) AS team_id
         FROM pm_player_match_score s
@@ -112,6 +158,7 @@ def ranking_miesiac(lnp, od, do):
           AND s.match_date::date BETWEEN %s AND %s
           AND m.minutes > 0
           AND s.score IS NOT NULL AND s.score <> 'NaN'::double precision
+          {_vf('s.')}
         GROUP BY s.player_id
       )
       SELECT agg.player_id::text, agg.keeper, agg.mecze, agg.avg_score, agg.team_id,
@@ -143,7 +190,7 @@ def baza_2526(lnp, ids, od="2025-07-01", do="2026-07-01"):
           FROM pm_player_match_score
           WHERE player_id::text IN ({chunk})
             AND match_date::date >= %s AND match_date::date < %s
-            AND overall_score IS NOT NULL
+            AND overall_score IS NOT NULL {_vf()}
           ORDER BY player_id, match_date DESC NULLS LAST
         """, (od, do))
         for pid, ov in cur.fetchall(): out[pid] = ov
@@ -159,7 +206,7 @@ def _last_overall(lnp, ids, season):
         cur.execute(f"""
           SELECT DISTINCT ON (player_id) player_id::text, overall_score
           FROM pm_player_match_score
-          WHERE season_id = %s AND player_id::text IN ({chunk}) AND overall_score IS NOT NULL
+          WHERE season_id = %s AND player_id::text IN ({chunk}) AND overall_score IS NOT NULL {_vf()}
           ORDER BY player_id, match_date DESC NULLS LAST
         """, (season,))
         for pid, ov in cur.fetchall(): out[pid] = ov
@@ -429,6 +476,228 @@ def build_html(players, okres, logo=None, footer="playmaker.pro", me=""):
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTML z PRZELACZNIKIEM 3 WIDOKOW (dla samodzielnego `ranking.html`)
+#  Nie uzywany przez streamlit (apka nadal wola build_html() per widok).
+# ─────────────────────────────────────────────────────────────────────────────
+
+TEMPLATE_MULTI = r'''<!DOCTYPE html>
+<html lang="pl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IV liga wielkopolska — ranking</title>
+<style>
+  :root{--bg:#0a0c10;--card:#12151c;--line:#20242e;--ink:#fff;--mut:#8a90a0;--blue:#3b74d6;--grn:#31C56A;--red:#F0603C;--gold:#E0A93C;}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Arial,sans-serif;font-size:16px;line-height:1.35}
+  .wrap{max-width:560px;margin:0 auto;padding:16px 14px 48px}
+  a{color:inherit;text-decoration:none}
+  .hd{display:flex;align-items:center;gap:12px;padding:4px 2px 14px;border-bottom:1px solid var(--line)}
+  .hd .logo{background:#fff;border-radius:12px;padding:7px;display:flex}
+  .hd .logo img{height:46px;width:auto;display:block}
+  .hd .t{font-weight:800;font-size:17px;line-height:1.1}
+  .hd .d{color:var(--mut);font-size:12px;margin-top:2px}
+  .view-switch{position:sticky;top:0;z-index:7;background:var(--bg);padding:10px 0 4px;margin:0 -2px}
+  .view-switch .seg{display:flex;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px;gap:3px;width:100%}
+  .view-switch .seg button{flex:1;border:0;background:transparent;color:var(--mut);font-size:13px;font-weight:700;padding:9px 6px;border-radius:9px;cursor:pointer;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+  .view-switch .seg button.on{background:var(--blue);color:#fff}
+  .filters{position:sticky;top:58px;z-index:5;background:linear-gradient(var(--bg),var(--bg) 80%,rgba(10,12,16,0));padding:12px 2px 8px}
+  .flabel{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;margin:8px 2px 4px}
+  .frow{display:flex;gap:8px;flex-wrap:wrap;padding-bottom:4px}
+  .seg{display:inline-flex;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px}
+  .seg button{border:0;background:transparent;color:var(--mut);font-size:13px;font-weight:700;padding:7px 12px;border-radius:8px;cursor:pointer;white-space:nowrap}
+  .seg button.on{background:var(--blue);color:#fff}
+  select{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:14px;font-weight:600;min-width:130px}
+  input.search{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:14px;width:100%;margin-top:8px}
+  .exp{margin-top:8px;width:100%;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--ink);font-weight:700;font-size:13px;cursor:pointer}
+  .exp:hover{border-color:var(--blue)}
+  .sec{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;margin:20px 2px 10px;font-weight:700}
+  .gain{display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px}
+  .gain.top{border-color:#33507f;background:linear-gradient(180deg,#141a26,#10131a)}
+  .gain .pos{font-weight:900;font-size:20px;color:var(--mut);min-width:26px;text-align:center}.gain.top .pos{color:var(--gold)}
+  .gain .info{flex:1;min-width:0}
+  .gain .nm{font-weight:800;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gain .cl{color:var(--mut);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .gain .chg{text-align:right;flex-shrink:0}.gain .big{font-weight:900;font-size:22px;line-height:1}
+  .gain .sub{color:var(--mut);font-size:12px;margin-top:3px;font-weight:600}
+  .badge{display:inline-block;font-size:11px;font-weight:800;color:#111;background:var(--gold);padding:1px 7px;border-radius:6px;margin-top:4px}
+  .chev{color:var(--mut);font-size:18px;flex-shrink:0}
+  .row{display:flex;align-items:center;gap:11px;padding:11px 8px;border-bottom:1px solid var(--line)}
+  .row.me{background:rgba(59,116,214,.12);border-radius:10px}
+  .row .pos{min-width:30px;text-align:center;font-weight:800;color:var(--mut);font-size:14px}
+  .row .info{flex:1;min-width:0}
+  .row .nm{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .cl{color:var(--mut);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .badge{font-size:10px;margin:0 0 0 6px;padding:1px 5px;vertical-align:1px}
+  .row .v{font-weight:800;font-size:16px;min-width:54px;text-align:right}
+  .row .m{min-width:34px;text-align:right;color:var(--mut);font-size:12px;font-weight:600}
+  .up{color:var(--grn)}.dn{color:var(--red)}
+  .more{width:100%;margin-top:12px;padding:12px;background:var(--card);border:1px solid var(--line);border-radius:12px;color:var(--ink);font-weight:700;font-size:14px;cursor:pointer}
+  .empty{color:var(--mut);text-align:center;padding:24px;font-size:14px}
+  .count{color:var(--mut);font-size:12px;margin:2px 2px 8px}
+  .foot{margin-top:26px;padding-top:16px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:12px}
+</style></head><body><div class="wrap">
+  <div class="hd">__BRAND__<div><div class="t">IV liga wielkopolska</div><div class="d" id="hdOkres">Ranking zawodników · __OKRES_DEFAULT__</div></div></div>
+  <div class="view-switch"><div class="seg" id="segView">__VIEW_BUTTONS__</div></div>
+  <div class="filters">
+    <div class="flabel">Widok / pozycja</div>
+    <div class="frow">
+      <div class="seg" id="segMode"><button data-v="forma" class="on">Forma</button><button data-v="progres">Progres</button></div>
+      <div class="seg" id="segPos"><button data-v="pol" class="on">z pola</button><button data-v="br">Bramkarze</button></div>
+    </div>
+    <div class="flabel">Filtry</div>
+    <div class="frow">
+      <div class="seg" id="segMin"><button data-v="1">≥1</button><button data-v="2" class="on">≥2 mecze</button><button data-v="3">≥3</button><button data-v="5">≥5</button></div>
+      <select id="fKlub"><option value="all">Wszystkie kluby</option></select>
+      <select id="fRok"><option value="all">Rocznik: wszystkie</option></select>
+    </div>
+    <input class="search" id="q" placeholder="Szukaj zawodnika…">
+    <button class="exp" id="expBtn">⬇ Eksport do Excela (bieżący widok)</button>
+  </div>
+  <div class="sec" id="topTitle">TOP forma miesiąca</div>
+  <div id="gains"></div>
+  <div class="sec" id="rankTitle">Ranking</div>
+  <div class="count" id="rankCount"></div>
+  <div id="rank"></div>
+  <button class="more" id="moreBtn" style="display:none"></button>
+  <div class="foot"><div>IV liga wielkopolska · sezon 2026/27</div><div>__FOOTER__</div></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+const VIEWS = __VIEWS__;
+const DEFAULT_KEY = __DEFAULT_KEY__;
+const CAP = 120;
+let currentView = DEFAULT_KEY;
+let PLAYERS = VIEWS[currentView].players;
+let mode="forma", fKeeper=false, fMin=2, fKlub="all", fRok="all", q="", shown=CAP;
+const MEQ=new URLSearchParams(location.search).get("me"); const MEI="__ME__"; const ME=MEQ||((MEI&&MEI.slice(0,2)!=="__")?MEI:null);
+const val=p=> mode==="progres"? p.progres : p.score;
+const f1=x=>x==null?"—":x.toFixed(1).replace(".",","); const fj=x=>x==null?"—":(x>0?"+":"")+x.toFixed(1).replace(".",",");
+const esc=s=>(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const href=u=>u?(u.startsWith("http")?u:"https://"+u):null;
+function passes(p){
+  if(p.keeper!==fKeeper) return false;
+  if((p.mecze||0)<fMin) return false;
+  if(fKlub!=="all" && p.club!==fKlub) return false;
+  if(fRok!=="all" && String(p.yob)!==fRok) return false;
+  if(mode==="progres" && p.progres==null) return false;
+  if(q && !(p.name||"").toLowerCase().includes(q)) return false;
+  return true;
+}
+function nm(p){const u=href(p.url);const i=esc(p.name||"—");return u?`<a href="${u}" target="_blank" rel="noopener">${i}</a>`:i;}
+function bdg(p){return p.badge?`<span class="badge">grał: ${esc(p.badge)}</span>`:"";}
+function go(u){if(u)window.open(u,"_blank","noopener");}
+function renderGains(list){
+  const el=document.getElementById("gains"),ttl=document.getElementById("topTitle");
+  ttl.textContent = mode==="progres" ? "TOP progres (vs koniec 25/26)" : "TOP forma";
+  const g=list.slice().sort((a,b)=>(val(b)??-999)-(val(a)??-999)).slice(0,5);
+  if(!g.length){el.innerHTML='<div class="empty">Brak zawodników dla tych filtrów.</div>';return;}
+  el.innerHTML=g.map((p,i)=>{
+    const big = mode==="progres" ? `<div class="big ${p.progres>=0?'up':'dn'}">${fj(p.progres)}</div>` : `<div class="big">${f1(p.score)}</div>`;
+    const sub = mode==="progres" ? `${f1(p.ov_base)} → ${f1(p.ov_now)}` : `${p.mecze} mecze`;
+    return `<div class="gain ${i===0?'top':''}" onclick="go('${href(p.url)||''}')">
+      <div class="pos">${i+1}</div>
+      <div class="info"><div class="nm">${nm(p)}</div><div class="cl">${esc(p.club||'')}${p.team&&p.team!==p.club?' · '+esc(p.team):''}</div>${bdg(p)}</div>
+      <div class="chg">${big}<div class="sub">${sub}</div></div>${href(p.url)?'<div class="chev">›</div>':''}</div>`;}).join("");
+}
+function renderRank(list){
+  const arr=list.slice().sort((a,b)=>(val(b)??-999)-(val(a)??-999));
+  document.getElementById("rankTitle").textContent = mode==="progres" ? "Ranking progresu" : "Ranking formy";
+  document.getElementById("rankCount").textContent = arr.length+" zawodników"+(arr.length>shown?(" · pokazano "+shown):"");
+  const el=document.getElementById("rank");
+  if(!arr.length){el.innerHTML='<div class="empty">Brak wyników.</div>';document.getElementById("moreBtn").style.display="none";return;}
+  el.innerHTML=arr.slice(0,shown).map((p,i)=>{
+    const me=(ME&&p.id===ME)?"me":"";
+    const v = mode==="progres" ? `<div class="v ${p.progres>=0?'up':'dn'}">${fj(p.progres)}</div>` : `<div class="v">${f1(p.score)}</div>`;
+    return `<div class="row ${me}" onclick="go('${href(p.url)||''}')"><div class="pos">${i+1}</div>
+      <div class="info"><div class="nm">${nm(p)}${bdg(p)}</div><div class="cl">${esc(p.club||'')}${p.team&&p.team!==p.club?' · '+esc(p.team):''}</div></div>
+      ${v}<div class="m">${p.mecze||0}m</div></div>`;}).join("");
+  const mb=document.getElementById("moreBtn");
+  if(arr.length>shown){mb.style.display="block";mb.textContent="Pokaż więcej ("+(arr.length-shown)+")";mb.onclick=()=>{shown+=CAP;renderRank(list);};}
+  else mb.style.display="none";
+  if(ME){const r=el.querySelector(".me");if(r)r.scrollIntoView({block:"center"});}
+}
+function render(){shown=Math.max(shown,CAP);const list=PLAYERS.filter(passes);renderGains(list);renderRank(list);}
+function refreshSelects(){
+  const sk=document.getElementById("fKlub"), sr=document.getElementById("fRok");
+  sk.innerHTML='<option value="all">Wszystkie kluby</option>';
+  sr.innerHTML='<option value="all">Rocznik: wszystkie</option>';
+  const kluby=[...new Set(PLAYERS.map(p=>p.club).filter(Boolean))].sort((a,b)=>a.localeCompare(b,"pl"));
+  kluby.forEach(v=>{const o=document.createElement("option");o.value=v;o.textContent=v;sk.appendChild(o);});
+  const roczniki=[...new Set(PLAYERS.map(p=>p.yob).filter(Boolean))].sort((a,b)=>b-a).map(String);
+  roczniki.forEach(v=>{const o=document.createElement("option");o.value=v;o.textContent=v;sr.appendChild(o);});
+  sk.value=(fKlub!=="all" && kluby.includes(fKlub))?fKlub:"all"; if(sk.value==="all") fKlub="all";
+  sr.value=(fRok!=="all" && roczniki.includes(fRok))?fRok:"all"; if(sr.value==="all") fRok="all";
+}
+function switchView(key){
+  if(!VIEWS[key]) return;
+  currentView = key;
+  PLAYERS = VIEWS[key].players;
+  document.getElementById("hdOkres").textContent = "Ranking zawodników · " + VIEWS[key].okres;
+  document.querySelectorAll("#segView button").forEach(b=>b.classList.toggle("on", b.dataset.v===key));
+  shown = CAP;
+  refreshSelects();
+  render();
+}
+function initFilters(){
+  refreshSelects();
+  document.getElementById("fKlub").onchange=e=>{fKlub=e.target.value;shown=CAP;render();};
+  document.getElementById("fRok").onchange=e=>{fRok=e.target.value;shown=CAP;render();};
+  document.getElementById("q").oninput=e=>{q=e.target.value.toLowerCase().trim();shown=CAP;render();};
+  const bind=(id,fn)=>document.querySelectorAll("#"+id+" button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#"+id+" button").forEach(x=>x.classList.remove("on"));b.classList.add("on");fn(b.dataset.v);shown=CAP;render();});
+  bind("segMode",v=>mode=v); bind("segPos",v=>fKeeper=(v==="br")); bind("segMin",v=>fMin=parseInt(v));
+  // widok switcher
+  document.querySelectorAll("#segView button").forEach(b=>b.onclick=()=>switchView(b.dataset.v));
+  document.getElementById("expBtn").onclick=exportExcel;
+}
+function exportExcel(){
+  if(typeof XLSX==="undefined"){alert("Eksport chwilowo niedostępny (brak biblioteki).");return;}
+  const arr=PLAYERS.filter(passes).sort((a,b)=>(val(b)??-999)-(val(a)??-999));
+  const rows=arr.map((p,i)=>({
+    "#": i+1, "Zawodnik": p.name||"", "Klub": p.club||"", "Drużyna": p.team||"",
+    "Rocznik": p.yob||"", "Pozycja": p.keeper?"bramkarz":"z pola", "Mecze": p.mecze||0,
+    "Śr. ocena (forma)": p.score, "Progres": p.progres,
+    "Overall teraz": p.ov_now, "Overall 25/26": p.ov_base, "Grał w": p.badge||""
+  }));
+  const ws=XLSX.utils.json_to_sheet(rows);
+  const wb=XLSX.utils.book_new();
+  const viewLabel = VIEWS[currentView].okres || currentView;
+  XLSX.utils.book_append_sheet(wb, ws, (mode==="progres"?"Progres":"Forma")+" - "+viewLabel.slice(0,15));
+  XLSX.writeFile(wb, "ranking_IV_liga_wlkp_" + currentView.replace(/[^a-z0-9]/gi,"_") + ".xlsx");
+}
+initFilters();render();
+</script></body></html>'''
+
+
+def build_html_multi(views, logo=None, footer="playmaker.pro", me=""):
+    """Zbuduj JEDEN plik HTML z przelacznikiem kilku widokow (slownik ladowany do przegladarki).
+
+    views: lista dict-ow [{"key":"main","label":"Października 2026","okres":"Października 2026","players":[...]},...]
+    Pierwszy element listy jest widokiem domyslnym.
+    """
+    if not views:
+        raise ValueError("views: pusta lista")
+    buttons_html = "".join(
+        f'<button data-v="{v["key"]}"{" class=\"on\"" if i==0 else ""}>{v["label"]}</button>'
+        for i, v in enumerate(views)
+    )
+    views_payload = {
+        v["key"]: {"okres": v.get("okres", v["label"]), "players": v["players"]}
+        for v in views
+    }
+    default_key = views[0]["key"]
+    default_okres = views[0].get("okres", views[0]["label"])
+    brand = (f'<div class="logo"><img src="{logo}" alt="WZPN"></div>'
+             if logo else '<div class="t">WZPN</div>')
+    return (TEMPLATE_MULTI
+            .replace("__BRAND__", brand)
+            .replace("__OKRES_DEFAULT__", default_okres)
+            .replace("__FOOTER__", footer)
+            .replace("__ME__", me or "")
+            .replace("__VIEW_BUTTONS__", buttons_html)
+            .replace("__VIEWS__", json.dumps(views_payload, ensure_ascii=False))
+            .replace("__DEFAULT_KEY__", json.dumps(default_key)))
+
+
 def _build_players(rows, now, base, odz, links, tm, cm):
     players = []
     for r in rows:
@@ -467,31 +736,31 @@ def _okres_label(od, do):
 
 
 def main():
+    global SCORE_VERSION, VER_COL
     ap = argparse.ArgumentParser(
         description="Generator rankingu WZPN IV ligi wielkopolskiej. "
-                    "Jedna komenda = do trzech plikow: glowny miesiac, "
-                    "drugi miesiac (opcjonalnie), sezon total.")
-    # Glowny miesiac (biezacy, np. pazdziernik)
+                    "Jedna komenda = do trzech plikow JSON + ranking.html z przelacznikiem widokow.")
     ap.add_argument("--od", default="2026-10-01",
                     help="poczatek glownego miesiaca (RRRR-MM-DD)")
     ap.add_argument("--do", dest="do_", default="2026-10-31",
                     help="koniec glownego miesiaca (RRRR-MM-DD)")
-    # Drugi miesiac (np. wrzesien - do porownania)
     ap.add_argument("--od2", default="2026-09-01",
                     help="poczatek drugiego miesiaca (RRRR-MM-DD); pusty string = pomin")
     ap.add_argument("--do2", default="2026-09-30",
                     help="koniec drugiego miesiaca (RRRR-MM-DD)")
-    # Sezon total
     ap.add_argument("--sezon-od", dest="sezon_od", default="2026-07-01",
                     help="poczatek sezonu (RRRR-MM-DD)")
     ap.add_argument("--sezon-do", dest="sezon_do", default=None,
                     help="koniec sezonu (RRRR-MM-DD); domyslnie dzisiaj")
-    # Skrot: generuj tylko glowny miesiac
     ap.add_argument("--tylko-glowny", action="store_true",
                     help="pomin drugi miesiac i sezon (szybciej)")
     ap.add_argument("--tylko-miesiac", action="store_true",
                     help="pomin tylko sezon total")
     ap.add_argument("--outdir", default=os.path.join(HERE, "data", "ranking"))
+    ap.add_argument("--wersja", default=SCORE_VERSION,
+                    help="wersja score z pm_player_match_score (domyslnie 3.0.0 = nowy)")
+    ap.add_argument("--kolumna-wersji", dest="kol_wersji", default=None,
+                    help="nazwa kolumny z wersja (domyslnie wykrywana automatycznie)")
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
 
@@ -504,6 +773,14 @@ def main():
                   _cfg("PGUSER", required=True),
                   _cfg("PGPASSWORD", required=True, secret=True))
     print("  OK")
+    SCORE_VERSION = a.wersja
+    VER_COL = wykryj_kolumne_wersji(lnp, a.kol_wersji)
+    print(f"  wersja score: {VER_COL} = '{SCORE_VERSION}'")
+    dup = sprawdz_duplikaty(lnp, a.od, a.do_)
+    if dup:
+        print(f"  UWAGA: {dup} par (zawodnik, mecz) dalej ma >1 wiersz w tej wersji — mecze liczone unikalnie")
+    else:
+        print("  duplikaty: 0 (1 wiersz na mecz) OK")
 
     rows_main = ranking_miesiac(lnp, a.od, a.do_)
     print(f"  glowny  {a.od}..{a.do_}: {len(rows_main)} zawodnikow")
@@ -518,7 +795,6 @@ def main():
         rows_sezon = ranking_miesiac(lnp, a.sezon_od, sezon_do)
         print(f"  sezon   {a.sezon_od}..{sezon_do}: {len(rows_sezon)} zawodnikow")
 
-    # wspolne queries dla union IDs - raz
     ids_all = list(
         {r[0] for r in rows_main}
         | {r[0] for r in rows_prev}
@@ -527,6 +803,9 @@ def main():
     now = overall_teraz(lnp, ids_all)
     base = baza_2526(lnp, ids_all)
     print(f"  overall teraz: {len(now)} | baza 25/26: {len(base)}")
+    if ids_all and len(base) < 0.5 * len(ids_all):
+        print(f"  UWAGA: tylko {len(base)}/{len(ids_all)} zawodnikow ma overall 25/26 w wersji "
+              f"{SCORE_VERSION} — progres bedzie pusty dla reszty (nie mieszamy wersji)")
     tiers = tier_leagues(lnp)
     odz = odznaki(lnp, ids_all, tiers)
     print(f"  szczeble: {len(tiers)} | odznaki: {len(odz)}")
@@ -544,17 +823,15 @@ def main():
         print(f"\n  {tag}: {len(players)} (polowi {polowi}, bramkarze {len(players)-polowi}) "
               f"| z progresem {prog} | z odznaka {bdg}")
 
-    # -- GLOWNY MIESIAC (ranking_data.json + html + csv) --
+    # -- GLOWNY MIESIAC --
     players_main = _build_players(rows_main, now, base, odz, links, tm, cm)
     okres_main = _okres_label(a.od, a.do_)
     data_main = {
         "players": players_main, "sezon": "2026/27", "okres": okres_main,
         "od": a.od, "do": a.do_, "zakres_typ": "miesiac",
-        "wygenerowano": today, "logo": logo,
+        "wygenerowano": today, "logo": logo, "wersja_score": SCORE_VERSION,
     }
     outp_main = _zapisz_json(data_main, a.outdir, "ranking_data")
-    with open(os.path.join(a.outdir, "ranking.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(players_main, okres_main, logo=logo))
     with open(os.path.join(a.outdir, "ranking_latest.csv"), "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["imie_nazwisko", "klub", "druzyna", "rocznik", "bramkarz", "mecze",
@@ -570,30 +847,47 @@ def main():
     summary(f"GLOWNY ({okres_main})", players_main)
     print(f"  JSON: {outp_main}")
 
-    # -- DRUGI MIESIAC (ranking_prev.json) --
+    # -- DRUGI MIESIAC --
+    players_prev = None
+    okres_prev = None
     if gen_drugi:
         players_prev = _build_players(rows_prev, now, base, odz, links, tm, cm)
         okres_prev = _okres_label(a.od2, a.do2)
         data_prev = {
             "players": players_prev, "sezon": "2026/27", "okres": okres_prev,
             "od": a.od2, "do": a.do2, "zakres_typ": "miesiac",
-            "wygenerowano": today, "logo": logo,
+            "wygenerowano": today, "logo": logo, "wersja_score": SCORE_VERSION,
         }
         outp_prev = _zapisz_json(data_prev, a.outdir, "ranking_prev")
         summary(f"DRUGI  ({okres_prev})", players_prev)
         print(f"  JSON: {outp_prev}")
 
-    # -- SEZON TOTAL (ranking_sezon.json) --
+    # -- SEZON TOTAL --
+    players_sezon = None
     if gen_sezon:
         players_sezon = _build_players(rows_sezon, now, base, odz, links, tm, cm)
         data_sezon = {
             "players": players_sezon, "sezon": "2026/27", "okres": "sezon 2026/27",
             "od": a.sezon_od, "do": sezon_do, "zakres_typ": "sezon",
-            "wygenerowano": today, "logo": logo,
+            "wygenerowano": today, "logo": logo, "wersja_score": SCORE_VERSION,
         }
         outp_sezon = _zapisz_json(data_sezon, a.outdir, "ranking_sezon")
         summary(f"SEZON  ({a.sezon_od}..{sezon_do})", players_sezon)
         print(f"  JSON: {outp_sezon}")
+
+    # -- HTML z PRZELACZNIKIEM (wszystkie dostepne widoki) --
+    views = [{"key": "main", "label": okres_main.capitalize(),
+              "okres": okres_main, "players": players_main}]
+    if players_prev is not None:
+        views.append({"key": "prev", "label": okres_prev.capitalize(),
+                      "okres": okres_prev, "players": players_prev})
+    if players_sezon is not None:
+        views.append({"key": "sezon", "label": "Sezon 2026/27",
+                      "okres": "sezon 2026/27", "players": players_sezon})
+    html_path = os.path.join(a.outdir, "ranking.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(build_html_multi(views, logo=logo))
+    print(f"\n  HTML (z przelacznikiem {len(views)} widokow): {html_path}")
 
 
 if __name__ == "__main__":
