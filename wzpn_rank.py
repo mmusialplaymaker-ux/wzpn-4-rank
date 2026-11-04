@@ -427,6 +427,8 @@ def build_html(players, okres, logo=None, footer="playmaker.pro", me=""):
             .replace("__DATA__", json.dumps(players, ensure_ascii=False)))
 
 
+
+
 def _build_players(rows, now, base, odz, links, tm, cm):
     players = []
     for r in rows:
@@ -441,8 +443,8 @@ def _build_players(rows, now, base, odz, links, tm, cm):
             "club": klub, "team": druzyna,
             "yob": (int(yob) if (yob and str(yob).isdigit()) else None),
             "keeper": bool(keeper), "mecze": int(mecze) if mecze is not None else 0,
-            "score": avg100,                 # FORMA miesiąca / sezonu (AVG, ×100)
-            "ov_now": ov_now, "ov_base": ov_base, "progres": prog,   # PROGRES (overall)
+            "score": avg100,
+            "ov_now": ov_now, "ov_base": ov_base, "progres": prog,
             "badge": odz.get(pid), "url": links.get(pid),
         })
     players.sort(key=lambda p: (p["score"] if p["score"] is not None else -1), reverse=True)
@@ -456,35 +458,72 @@ def _zapisz_json(data, outdir, basename):
     return outp
 
 
+def _okres_label(od, do):
+    try:
+        m = datetime.strptime(od, "%Y-%m-%d")
+        return f"{MIESIACE[m.month]} {m.year}"
+    except Exception:
+        return f"{od}..{do}"
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--od", default="2026-09-01", help="początek miesiąca (RRRR-MM-DD)")
-    ap.add_argument("--do", dest="do_", default="2026-09-30", help="koniec miesiąca (RRRR-MM-DD)")
-    ap.add_argument("--outdir", default=os.path.join(HERE, "data", "ranking"))
+    ap = argparse.ArgumentParser(
+        description="Generator rankingu WZPN IV ligi wielkopolskiej. "
+                    "Jedna komenda = do trzech plikow: glowny miesiac, "
+                    "drugi miesiac (opcjonalnie), sezon total.")
+    # Glowny miesiac (biezacy, np. pazdziernik)
+    ap.add_argument("--od", default="2026-10-01",
+                    help="poczatek glownego miesiaca (RRRR-MM-DD)")
+    ap.add_argument("--do", dest="do_", default="2026-10-31",
+                    help="koniec glownego miesiaca (RRRR-MM-DD)")
+    # Drugi miesiac (np. wrzesien - do porownania)
+    ap.add_argument("--od2", default="2026-09-01",
+                    help="poczatek drugiego miesiaca (RRRR-MM-DD); pusty string = pomin")
+    ap.add_argument("--do2", default="2026-09-30",
+                    help="koniec drugiego miesiaca (RRRR-MM-DD)")
+    # Sezon total
+    ap.add_argument("--sezon-od", dest="sezon_od", default="2026-07-01",
+                    help="poczatek sezonu (RRRR-MM-DD)")
+    ap.add_argument("--sezon-do", dest="sezon_do", default=None,
+                    help="koniec sezonu (RRRR-MM-DD); domyslnie dzisiaj")
+    # Skrot: generuj tylko glowny miesiac
+    ap.add_argument("--tylko-glowny", action="store_true",
+                    help="pomin drugi miesiac i sezon (szybciej)")
     ap.add_argument("--tylko-miesiac", action="store_true",
-                    help="pomiń generowanie zakresu sezonu (szybciej)")
+                    help="pomin tylko sezon total")
+    ap.add_argument("--outdir", default=os.path.join(HERE, "data", "ranking"))
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
 
-    SEZON_OD = "2026-07-01"
-    SEZON_DO = date.today().strftime("%Y-%m-%d")
+    gen_drugi = bool(a.od2) and not a.tylko_glowny
+    gen_sezon = (not a.tylko_glowny) and (not a.tylko_miesiac)
+    sezon_do = a.sezon_do or date.today().strftime("%Y-%m-%d")
 
-    print("[LNP] łączę (tunel SSH musi być OTWARTY w osobnym oknie) ...")
+    print("[LNP] laczenie (tunel SSH musi byc OTWARTY w osobnym oknie) ...")
     lnp = connect(_cfg("PGDATABASE", required=True),
                   _cfg("PGUSER", required=True),
                   _cfg("PGPASSWORD", required=True, secret=True))
     print("  OK")
 
-    rows_mies = ranking_miesiac(lnp, a.od, a.do_)
-    print(f"  miesiąc {a.od}..{a.do_}: {len(rows_mies)} zawodników")
+    rows_main = ranking_miesiac(lnp, a.od, a.do_)
+    print(f"  glowny  {a.od}..{a.do_}: {len(rows_main)} zawodnikow")
+
+    rows_prev = []
+    if gen_drugi:
+        rows_prev = ranking_miesiac(lnp, a.od2, a.do2)
+        print(f"  drugi   {a.od2}..{a.do2}: {len(rows_prev)} zawodnikow")
 
     rows_sezon = []
-    if not a.tylko_miesiac:
-        rows_sezon = ranking_miesiac(lnp, SEZON_OD, SEZON_DO)
-        print(f"  sezon   {SEZON_OD}..{SEZON_DO}: {len(rows_sezon)} zawodników")
+    if gen_sezon:
+        rows_sezon = ranking_miesiac(lnp, a.sezon_od, sezon_do)
+        print(f"  sezon   {a.sezon_od}..{sezon_do}: {len(rows_sezon)} zawodnikow")
 
-    # wspólne queries dla union IDs - raz
-    ids_all = list({r[0] for r in rows_mies} | {r[0] for r in rows_sezon})
+    # wspolne queries dla union IDs - raz
+    ids_all = list(
+        {r[0] for r in rows_main}
+        | {r[0] for r in rows_prev}
+        | {r[0] for r in rows_sezon}
+    )
     now = overall_teraz(lnp, ids_all)
     base = baza_2526(lnp, ids_all)
     print(f"  overall teraz: {len(now)} | baza 25/26: {len(base)}")
@@ -496,55 +535,65 @@ def main():
     lnp.close()
     tm, cm = load_maps()
     logo = _logo()
+    today = date.today().strftime("%Y-%m-%d")
 
-    # ── MIESIĄC ──
-    players_mies = _build_players(rows_mies, now, base, odz, links, tm, cm)
-    try:
-        m = datetime.strptime(a.od, "%Y-%m-%d")
-        okres_mies = f"{MIESIACE[m.month]} {m.year}"
-    except Exception:
-        okres_mies = f"{a.od}..{a.do_}"
-    data_mies = {
-        "players": players_mies, "sezon": "2026/27", "okres": okres_mies,
+    def summary(tag, players):
+        polowi = sum(1 for p in players if not p["keeper"])
+        prog = sum(1 for p in players if p["progres"] is not None)
+        bdg = sum(1 for p in players if p["badge"])
+        print(f"\n  {tag}: {len(players)} (polowi {polowi}, bramkarze {len(players)-polowi}) "
+              f"| z progresem {prog} | z odznaka {bdg}")
+
+    # -- GLOWNY MIESIAC (ranking_data.json + html + csv) --
+    players_main = _build_players(rows_main, now, base, odz, links, tm, cm)
+    okres_main = _okres_label(a.od, a.do_)
+    data_main = {
+        "players": players_main, "sezon": "2026/27", "okres": okres_main,
         "od": a.od, "do": a.do_, "zakres_typ": "miesiac",
-        "wygenerowano": date.today().strftime("%Y-%m-%d"), "logo": logo,
+        "wygenerowano": today, "logo": logo,
     }
-    outp_mies = _zapisz_json(data_mies, a.outdir, "ranking_data")
-
-    # HTML + CSV generowany dla widoku miesięcznego (jak dotąd)
+    outp_main = _zapisz_json(data_main, a.outdir, "ranking_data")
     with open(os.path.join(a.outdir, "ranking.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(players_mies, okres_mies, logo=logo))
+        f.write(build_html(players_main, okres_main, logo=logo))
     with open(os.path.join(a.outdir, "ranking_latest.csv"), "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["imie_nazwisko", "klub", "druzyna", "rocznik", "bramkarz", "mecze",
                     "score_forma", "overall_teraz", "overall_2526", "progres", "odznaka", "url"])
-        for p in players_mies:
-            w.writerow([p["name"], p["club"], p["team"], p["yob"] or "", "TAK" if p["keeper"] else "", p["mecze"],
-                        p["score"], p["ov_now"] if p["ov_now"] is not None else "",
+        for p in players_main:
+            w.writerow([p["name"], p["club"], p["team"], p["yob"] or "",
+                        "TAK" if p["keeper"] else "", p["mecze"],
+                        p["score"],
+                        p["ov_now"] if p["ov_now"] is not None else "",
                         p["ov_base"] if p["ov_base"] is not None else "",
-                        p["progres"] if p["progres"] is not None else "", p["badge"] or "", p["url"] or ""])
+                        p["progres"] if p["progres"] is not None else "",
+                        p["badge"] or "", p["url"] or ""])
+    summary(f"GLOWNY ({okres_main})", players_main)
+    print(f"  JSON: {outp_main}")
 
-    polowi_m = sum(1 for p in players_mies if not p["keeper"])
-    print(f"\n  MIESIĄC: {len(players_mies)} (polowi {polowi_m}, bramkarze {len(players_mies)-polowi_m}) | "
-          f"z progresem {sum(1 for p in players_mies if p['progres'] is not None)} | "
-          f"z odznaką {sum(1 for p in players_mies if p['badge'])}")
-    print(f"  okres: {okres_mies}")
-    print(f"✓ JSON: {outp_mies}")
+    # -- DRUGI MIESIAC (ranking_prev.json) --
+    if gen_drugi:
+        players_prev = _build_players(rows_prev, now, base, odz, links, tm, cm)
+        okres_prev = _okres_label(a.od2, a.do2)
+        data_prev = {
+            "players": players_prev, "sezon": "2026/27", "okres": okres_prev,
+            "od": a.od2, "do": a.do2, "zakres_typ": "miesiac",
+            "wygenerowano": today, "logo": logo,
+        }
+        outp_prev = _zapisz_json(data_prev, a.outdir, "ranking_prev")
+        summary(f"DRUGI  ({okres_prev})", players_prev)
+        print(f"  JSON: {outp_prev}")
 
-    # ── SEZON TOTAL ──
-    if not a.tylko_miesiac:
+    # -- SEZON TOTAL (ranking_sezon.json) --
+    if gen_sezon:
         players_sezon = _build_players(rows_sezon, now, base, odz, links, tm, cm)
         data_sezon = {
             "players": players_sezon, "sezon": "2026/27", "okres": "sezon 2026/27",
-            "od": SEZON_OD, "do": SEZON_DO, "zakres_typ": "sezon",
-            "wygenerowano": date.today().strftime("%Y-%m-%d"), "logo": logo,
+            "od": a.sezon_od, "do": sezon_do, "zakres_typ": "sezon",
+            "wygenerowano": today, "logo": logo,
         }
         outp_sezon = _zapisz_json(data_sezon, a.outdir, "ranking_sezon")
-        polowi_s = sum(1 for p in players_sezon if not p["keeper"])
-        print(f"\n  SEZON:   {len(players_sezon)} (polowi {polowi_s}, bramkarze {len(players_sezon)-polowi_s}) | "
-              f"z progresem {sum(1 for p in players_sezon if p['progres'] is not None)}")
-        print(f"  zakres: {SEZON_OD}..{SEZON_DO}")
-        print(f"✓ JSON: {outp_sezon}")
+        summary(f"SEZON  ({a.sezon_od}..{sezon_do})", players_sezon)
+        print(f"  JSON: {outp_sezon}")
 
 
 if __name__ == "__main__":

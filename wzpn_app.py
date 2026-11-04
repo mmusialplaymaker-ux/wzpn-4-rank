@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-wzpn_app.py — serwuje ranking IV ligi wielkopolskiej.
+wzpn_app.py - serwuje ranking IV ligi wielkopolskiej.
 
-Dwa zakresy do przełączania (jeśli oba JSON-y wygenerowane):
-  • Miesiąc  → data/ranking/ranking_data.json
-  • Sezon    → data/ranking/ranking_sezon.json
+Trzy zakresy do przelaczania (gdy odpowiednie JSON-y istnieja):
+  * glowny miesiac  -> data/ranking/ranking_data.json
+  * drugi miesiac   -> data/ranking/ranking_prev.json
+  * sezon total     -> data/ranking/ranking_sezon.json
 
-Generowanie danych (jedna komenda = oba pliki):
-    python wzpn_rank.py --od 2026-09-01 --do 2026-09-30
-Szybciej, tylko miesiąc:
-    python wzpn_rank.py --od 2026-09-01 --do 2026-09-30 --tylko-miesiac
+Generowanie danych (jedna komenda = trzy pliki):
+    python wzpn_rank.py --od 2026-10-01 --do 2026-10-31 \
+                       --od2 2026-09-01 --do2 2026-09-30
 
 URUCHOMIENIE:
     streamlit run wzpn_app.py
 
 Link zawodnika: <adres-apki>/?me=<player_id UUID>
-Eksport do Excela jest w samej apce (jeden przycisk, respektuje filtry).
 """
 import json
 import os
@@ -25,10 +24,11 @@ import streamlit.components.v1 as components
 from wzpn_rank import build_html
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_MIES = os.path.join(HERE, "data", "ranking", "ranking_data.json")
+DATA_MAIN  = os.path.join(HERE, "data", "ranking", "ranking_data.json")
+DATA_PREV  = os.path.join(HERE, "data", "ranking", "ranking_prev.json")
 DATA_SEZON = os.path.join(HERE, "data", "ranking", "ranking_sezon.json")
 
-st.set_page_config(page_title="IV liga wielkopolska — ranking", page_icon="⚽",
+st.set_page_config(page_title="IV liga wielkopolska - ranking", page_icon="⚽",
                    layout="centered", initial_sidebar_state="collapsed")
 st.markdown("""<style>
   #MainMenu, header, footer {visibility:hidden;}
@@ -44,11 +44,15 @@ def load(path, mtime):
         return json.load(f)
 
 
-# zbierz dostępne zakresy
+# zbierz dostepne zakresy w kolejnosci: glowny miesiac -> drugi miesiac -> sezon
 dostepne = {}
-if os.path.exists(DATA_MIES):
-    d = load(DATA_MIES, os.path.getmtime(DATA_MIES))
-    label = d.get("okres", "Miesiąc").capitalize()
+if os.path.exists(DATA_MAIN):
+    d = load(DATA_MAIN, os.path.getmtime(DATA_MAIN))
+    label = (d.get("okres") or "Miesiac").capitalize()
+    dostepne[label] = d
+if os.path.exists(DATA_PREV):
+    d = load(DATA_PREV, os.path.getmtime(DATA_PREV))
+    label = (d.get("okres") or "Poprzedni").capitalize()
     dostepne[label] = d
 if os.path.exists(DATA_SEZON):
     d = load(DATA_SEZON, os.path.getmtime(DATA_SEZON))
